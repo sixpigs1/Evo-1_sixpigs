@@ -30,14 +30,14 @@ sys.path.insert(0, str(CALVIN_ROOT / "calvin_env"))
 # Configuration
 ######################################
 class Args:
-    horizon = 14  # Number of actions to execute per inference
-    max_steps = 360 // 6 + 1  # Maximum steps per episode (CALVIN uses EP_LEN=360)
+    horizon = 12  # Number of actions to execute per inference
+    max_steps = 50  # Maximum steps per episode (CALVIN uses EP_LEN=360)
     SERVER_URL = "ws://0.0.0.0:9000"
     ckpt_name = "Evo1_calvin"
     num_sequences = 1000  # Number of evaluation sequences
     SEED = 42
     dataset_path = str(CALVIN_ROOT / "dataset" / "calvin_debug_dataset")  # Update this path
-    save_video = True
+    save_video = False
 
 
 args = Args()
