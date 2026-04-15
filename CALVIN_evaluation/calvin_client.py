@@ -9,6 +9,7 @@ import os
 import sys
 import logging
 import random
+from datetime import datetime
 from pathlib import Path
 from collections import Counter, defaultdict
 
@@ -33,7 +34,6 @@ class Args:
     max_steps = 360 // 6 + 1  # Maximum steps per episode (CALVIN uses EP_LEN=360)
     SERVER_URL = "ws://0.0.0.0:9000"
     ckpt_name = "Evo1_calvin"
-    log_file = f"./log_file/{ckpt_name}.txt"
     num_sequences = 1000  # Number of evaluation sequences
     SEED = 42
     dataset_path = str(CALVIN_ROOT / "dataset" / "calvin_debug_dataset")  # Update this path
@@ -42,14 +42,17 @@ class Args:
 
 args = Args()
 
-os.makedirs(os.path.dirname(args.log_file), exist_ok=True)
+# ========= Run-specific log directory (named by timestamp) =========
+RUN_TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+RUN_LOG_DIR = Path(f"./log_file/{args.ckpt_name}/{RUN_TIMESTAMP}")
+RUN_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # ========= Logging =========
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler(args.log_file, mode='a'),
+        logging.FileHandler(RUN_LOG_DIR / "run.log", mode='w'),
         logging.StreamHandler()
     ]
 )
@@ -275,7 +278,8 @@ async def rollout(
     Execute a single subtask rollout.
     
     Returns:
-        (success: bool, frames: list)
+        (success: bool, frames: list, steps_used: int)
+        steps_used is the step count at success, or total steps executed on failure.
     """
     if debug:
         log.info(f"Executing subtask: {subtask}")
@@ -297,12 +301,9 @@ async def rollout(
         try:
             action_list = json.loads(result)
             actions = np.array(action_list)
-            # if debug:
-            #     log.info(f"[Step {step}] Received actions shape: {actions.shape}")
-                # log.info(f"The whole action: {np.array2string(actions, threshold=np.inf)}")
         except Exception as e:
             log.error(f"Action parsing failed: {e}")
-            return False, frames
+            return False, frames, total_steps
         
         # Execute actions
         for i in range(min(horizon, len(actions))):
@@ -316,11 +317,7 @@ async def rollout(
             gripper_action = 1 if raw_action[6] > 0.5 else -1
             
             # CALVIN robot.apply_action expects: (target_ee_pos, target_ee_orn, gripper_action)
-            # where target_ee_pos is (3,), target_ee_orn is (3,) or (4,), gripper_action is 1 or -1
             action = (target_ee_pos, target_ee_orn, gripper_action)
-            
-            # if debug:
-            #     log.info(f"  Action[{i}]: pos={target_ee_pos}, orn={target_ee_orn}, gripper={gripper_action}")
             
             # Step environment
             obs, _, _, current_info = env.step(action)
@@ -338,11 +335,11 @@ async def rollout(
             if len(current_task_info) > 0:
                 if debug:
                     log.info(f"  Task {subtask} completed at step {total_steps}")
-                return True, frames
+                return True, frames, total_steps
     
     if debug:
         log.info(f"  Task {subtask} failed after {total_steps} steps")
-    return False, frames
+    return False, frames, total_steps
 
 
 async def evaluate_sequence(
@@ -354,36 +351,56 @@ async def evaluate_sequence(
     val_annotations: dict,
     horizon: int,
     max_steps: int,
+    seq_idx: int = 0,
     debug: bool = False
 ) -> tuple:
     """
     Evaluate a sequence of 5 language instructions.
     
     Returns:
-        (success_count: int, all_frames: list)
+        (success_count: int, all_frames: list, subtask_details: list)
+        subtask_details: list of dicts with keys: subtask, success, steps, annotation
     """
     robot_obs, scene_obs = get_env_state_for_initial_condition(initial_state)
     env.reset(robot_obs=robot_obs, scene_obs=scene_obs)
     
     success_counter = 0
     all_frames = []
+    subtask_details = []
     
-    if debug:
-        log.info(f"Evaluating sequence: {' -> '.join(eval_sequence)}")
+    seq_str = " -> ".join(eval_sequence)
+    log.info(f"[Seq {seq_idx:04d}] Sequence: {seq_str}")
     
-    for subtask in eval_sequence:
-        success, frames = await rollout(
+    for task_idx, subtask in enumerate(eval_sequence):
+        annotation = val_annotations[subtask][0]
+        success, frames, steps_used = await rollout(
             ws, env, task_oracle, subtask, val_annotations,
             horizon, max_steps, debug
         )
         all_frames.extend(frames)
         
+        detail = {
+            "task_idx": task_idx + 1,
+            "subtask": subtask,
+            "annotation": annotation,
+            "success": success,
+            "steps_used": steps_used,
+        }
+        subtask_details.append(detail)
+        
+        status_str = f"✓ success (step {steps_used})" if success else f"✗ failed  (step {steps_used})"
+        log.info(f"  [{task_idx + 1}/5] {subtask:<35s} | {status_str}")
+        
         if success:
             success_counter += 1
         else:
-            return success_counter, all_frames
+            # Log remaining skipped tasks
+            for remaining in eval_sequence[task_idx + 1:]:
+                log.info(f"  [skip]  {remaining:<35s} | — skipped (previous task failed)")
+            break
     
-    return success_counter, all_frames
+    log.info(f"  => Sequence result: {success_counter}/{len(eval_sequence)} subtasks completed")
+    return success_counter, all_frames, subtask_details
 
 
 async def run(
@@ -392,6 +409,7 @@ async def run(
     num_sequences: int,
     horizon: int,
     max_steps: int,
+    seed: int,
     save_video: bool = True,
     debug: bool = False
 ):
@@ -404,15 +422,25 @@ async def run(
         num_sequences: Number of evaluation sequences
         horizon: Number of actions to execute per inference
         max_steps: Maximum inference steps per subtask
+        seed: Random seed
         save_video: Whether to save evaluation videos
         debug: Whether to print debug info
     """
-    log.info(f"=== Starting CALVIN Evaluation ===")
-    log.info(f"Server URL: {SERVER_URL}")
-    log.info(f"Dataset path: {dataset_path}")
-    log.info(f"Number of sequences: {num_sequences}")
-    log.info(f"Horizon: {horizon}")
-    log.info(f"Max steps: {max_steps}")
+    # ---- Header: log hyperparameters ----
+    log.info("=" * 60)
+    log.info("  CALVIN Evaluation Run")
+    log.info("=" * 60)
+    log.info(f"  Timestamp     : {RUN_TIMESTAMP}")
+    log.info(f"  Checkpoint    : {args.ckpt_name}")
+    log.info(f"  Server URL    : {SERVER_URL}")
+    log.info(f"  Dataset path  : {dataset_path}")
+    log.info(f"  Num sequences : {num_sequences}  (default: {Args.num_sequences})")
+    log.info(f"  Horizon       : {horizon}  (default: {Args.horizon})")
+    log.info(f"  Max steps     : {max_steps}  (default: {Args.max_steps})")
+    log.info(f"  Seed          : {seed}  (default: {Args.SEED})")
+    log.info(f"  Save video    : {save_video}")
+    log.info(f"  Log dir       : {RUN_LOG_DIR}")
+    log.info("=" * 60)
     
     # Initialize environment
     log.info("Creating CALVIN environment...")
@@ -429,19 +457,27 @@ async def run(
     eval_sequences = get_sequences(num_sequences)
     
     results = []
-    video_save_dir = f"./video_log_file/{args.ckpt_name}"
+    all_subtask_details = []  # Per-sequence subtask detail records
+    video_save_dir = str(RUN_LOG_DIR / "videos")
     
     async with websockets.connect(SERVER_URL, max_size=100_000_000) as ws:
         log.info("Connected to Evo1 server")
+        log.info("-" * 60)
         
         eval_iter = tqdm(eval_sequences, position=0, leave=True) if not debug else eval_sequences
         
         for seq_idx, (initial_state, eval_sequence) in enumerate(eval_iter):
-            success_count, frames = await evaluate_sequence(
+            success_count, frames, subtask_details = await evaluate_sequence(
                 ws, env, task_oracle, initial_state, eval_sequence,
-                val_annotations, horizon, max_steps, debug
+                val_annotations, horizon, max_steps, seq_idx, debug
             )
             results.append(success_count)
+            all_subtask_details.append({
+                "seq_idx": seq_idx,
+                "sequence": eval_sequence,
+                "success_count": success_count,
+                "subtasks": subtask_details,
+            })
             
             # Update progress bar
             if not debug:
@@ -454,12 +490,21 @@ async def run(
                 video_filename = f"seq{seq_idx:04d}_success{success_count}.mp4"
                 save_video_to_file(frames, video_filename, fps=10, save_dir=video_save_dir)
     
+    # Save per-sequence subtask details to JSON
+    details_file = RUN_LOG_DIR / "subtask_details.json"
+    with open(details_file, "w") as f:
+        json.dump(all_subtask_details, f, indent=2)
+    log.info(f"Per-sequence subtask details saved to {details_file}")
+    
     # Print and save final results
-    log_dir = f"./log_file/{args.ckpt_name}"
-    print_and_save(results, eval_sequences, log_dir)
+    log.info("-" * 60)
+    print_and_save(results, eval_sequences, str(RUN_LOG_DIR))
     
     env.close()
-    log.info("=== Evaluation Complete ===")
+    log.info("=" * 60)
+    log.info("  Evaluation Complete")
+    log.info(f"  All logs saved to: {RUN_LOG_DIR}")
+    log.info("=" * 60)
 
 
 ######################################
@@ -491,6 +536,7 @@ if __name__ == "__main__":
         num_sequences=cli_args.num_sequences,
         horizon=cli_args.horizon,
         max_steps=cli_args.max_steps,
+        seed=cli_args.seed,
         save_video=cli_args.save_video,
         debug=cli_args.debug
     ))
