@@ -24,8 +24,6 @@ CALVIN_ROOT = Path(__file__).absolute().parents[2] / "calvin"
 sys.path.insert(0, str(CALVIN_ROOT / "calvin_models"))
 sys.path.insert(0, str(CALVIN_ROOT / "calvin_env"))
 
-from calvin_env.envs.play_table_env import get_env
-
 
 ######################################
 # Configuration
@@ -244,10 +242,19 @@ def print_and_save(results, sequences, log_dir: str, epoch: str = "eval"):
 # Environment Setup
 ######################################
 def make_env(dataset_path: str):
-    """Create CALVIN environment."""
+    """Create CALVIN environment without tactile sensor (avoids numpy/networkx incompatibility)."""
     val_folder = Path(dataset_path) / "validation"
-    env = get_env(val_folder, show_gui=False)
-    
+    render_conf = OmegaConf.load(val_folder / ".hydra" / "merged_config.yaml")
+
+    # Remove tactile camera to avoid tacto -> pyrender -> networkx -> np.int error
+    if "tactile" in render_conf.cameras:
+        del render_conf.cameras["tactile"]
+        log.info("Removed tactile sensor from camera config (numpy compatibility fix)")
+
+    if not hydra.core.global_hydra.GlobalHydra.instance().is_initialized():
+        hydra.initialize(".")
+    env = hydra.utils.instantiate(render_conf.env, show_gui=False, use_vr=False, use_scene_info=True)
+
     return env
 
 
